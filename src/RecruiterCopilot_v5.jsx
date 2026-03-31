@@ -201,141 +201,107 @@ function safeJ(t){
   return null;
 }
 
-// ─── RATE LIMIT TRACKER ───────────────────────────────────────────────────────
-// Tracks last successful call time to warn if called too soon again
-let _lastCallMs = 0;
-function msUntilSafe(){ return Math.max(0, 20000-( Date.now()-_lastCallMs)); }
+// ─── GEMINI API HELPER ────────────────────────────────────────────────────────
+// Google Gemini 1.5 Flash — completely free, no credit card needed
+// Free tier: 15 requests/minute, 1 million tokens/day
+// Get free API key at: aistudio.google.com
 
-// Read Retry-After from 429 response (API tells us exactly how long to wait)
-async function getRetryAfterMs(res){
-  const ra=res.headers?.get?.("retry-after")||res.headers?.get?.("x-ratelimit-reset-requests");
-  if(ra){
-    const secs=parseFloat(ra);
-    if(!isNaN(secs)&&secs>0) return Math.ceil(secs)*1000;
+async function callGemini(prompt, maxTokens=1600, attempt=0){
+  const res = await fetch("/api/gemini", {
+    method:"POST",
+    headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({ prompt, maxTokens })
+  });
+
+  if(res.status===429){
+    // Gemini free tier: wait 10s and retry
+    const wait = (attempt+1)*10000;
+    if(attempt<3){
+      await new Promise(r=>setTimeout(r,wait));
+      return callGemini(prompt,maxTokens,attempt+1);
+    }
+    throw new Error("Too many requests — please wait 30 seconds and try again.");
   }
-  return null;
+  if(!res.ok){
+    if(attempt<2){
+      await new Promise(r=>setTimeout(r,3000));
+      return callGemini(prompt,maxTokens,attempt+1);
+    }
+    const err = await res.json().catch(()=>({}));
+    throw new Error(err.error||"AI service error. Please try again.");
+  }
+  const d = await res.json();
+  return d.text||"";
 }
 
 // ─── API — PHASE 1: FAST RANKING ──────────────────────────────────────────────
-// Token budget per call (2 resumes): input ~900, output ~600 = ~1500 total
-// Token budget per call (5 resumes): input ~1400, output ~1500 = ~2900 total
 async function apiRank(jd, resumes, attempt=0, onStatus){
   if(attempt>0 && onStatus) onStatus(`Retrying… (attempt ${attempt+1})`);
 
-  // Trim aggressively — first 1000 chars of a resume contains name/skills/role
-  const jdSnip=jd.slice(0,700);
-  const resumeSnip=resumes.map((r,i)=>
+  const jdSnip = jd.slice(0,700);
+  const resumeSnip = resumes.map((r,i)=>
     `[${i+1}] ${r.name}\n${r.text.slice(0,1000)}`
   ).join("\n---\n");
 
-  const res=await fetch("/api/claude",{
-    method:"POST",headers:{"Content-Type":"application/json"},
-    body:JSON.stringify({
-      model:"claude-sonnet-4-20250514",
-      max_tokens:1600,
-      system:`Indian recruitment AI. Analyse resumes vs JD. Return ONLY raw JSON array. No markdown. No preamble. EVERY candidate must appear.`,
-      messages:[{role:"user",content:`${resumes.length} resume(s) vs JD. Return JSON array with EXACTLY ${resumes.length} objects.
-Scores: ≥71=STRONG FIT | 50-70=CAN BE CONSIDERED | <50=FAIL. Salary INR LPA.
+  const prompt = `You are an expert Indian recruitment AI. Analyse these ${resumes.length} resume(s) against the job description.
 
-JD: ${jdSnip}
+Return ONLY a raw JSON array with EXACTLY ${resumes.length} objects. No markdown. No explanation. Just the JSON array.
+
+SCORING RULES: overallScore ≥71 = STRONG FIT | 50-70 = CAN BE CONSIDERED | <50 = FAIL
+Salary always in INR LPA.
+
+JOB DESCRIPTION:
+${jdSnip}
 
 RESUMES:
 ${resumeSnip}
 
-Each object: {"name":"","currentRole":"","currentCompany":"","yearsExperience":null,"overallScore":0,"confidenceScore":0,"skillMatch":0,"experienceRelevance":0,"leadershipScore":0,"cultureFit":0,"stabilityScore":0,"hiringRecommendation":"","recruiterSummary":"3 lines max","standoutFact":"","top5Skills":[],"missingSkills":[],"strengths":[],"riskFlags":[],"experienceGapSummary":"","expectedCTCMin":0,"expectedCTCMax":0,"noticePeriod":"","isDuplicate":false}`}]
-    })
-  });
+Return JSON array where each object has exactly these fields:
+{"name":"","currentRole":"","currentCompany":"","yearsExperience":null,"overallScore":0,"confidenceScore":0,"skillMatch":0,"experienceRelevance":0,"leadershipScore":0,"cultureFit":0,"stabilityScore":0,"hiringRecommendation":"","recruiterSummary":"3 lines max","standoutFact":"","top5Skills":[],"missingSkills":[],"strengths":[],"riskFlags":[],"experienceGapSummary":"","expectedCTCMin":0,"expectedCTCMax":0,"noticePeriod":"","isDuplicate":false}`;
 
-  if(res.status===429){
-    // Read exactly how long the API wants us to wait
-    const raMs = await getRetryAfterMs(res);
-    const waitMs = raMs || (attempt+1)*12000;
-    const waitSecs = Math.ceil(waitMs/1000);
-    if(attempt<3){
-      if(onStatus){
-        // Countdown so recruiter knows exactly how long
-        for(let i=waitSecs;i>0;i--){
-          onStatus(`Rate limit hit — waiting ${i}s before retry…`);
-          await new Promise(r=>setTimeout(r,1000));
-        }
-      } else {
-        await new Promise(r=>setTimeout(r,waitMs));
-      }
-      return apiRank(jd,resumes,attempt+1,onStatus);
-    }
-    throw new Error(`Rate limit reached. Please wait ${waitSecs} seconds and click Screen again.`);
+  try{
+    const text = await callGemini(prompt, 1600, attempt);
+    return text;
+  }catch(err){
+    if(onStatus) onStatus(err.message);
+    throw err;
   }
-  if(!res.ok){
-    const e=await res.json().catch(()=>({}));
-    if(attempt<2){
-      if(onStatus) onStatus(`Connection issue — retrying…`);
-      await new Promise(r=>setTimeout(r,3000));
-      return apiRank(jd,resumes,attempt+1,onStatus);
-    }
-    throw new Error("Screening failed. Please check your connection and try again.");
-  }
-  _lastCallMs=Date.now();
-  const d=await res.json();
-  return d.content?.map(b=>b.text||"").join("")||"";
 }
 
 // ─── API — PHASE 2A: INTELLIGENCE REPORT ─────────────────────────────────────
 async function apiReport(jd, cand, attempt=0){
-  const jdSnip=jd.slice(0,600);
-  const cvSnip=cand.resumeText?.slice(0,1200)||"";
-  const scores=`score:${cand.overallScore} skill:${cand.skillMatch} exp:${cand.experienceRelevance} strengths:${(cand.strengths||[]).slice(0,2).join("|")} gaps:${(cand.missingSkills||[]).slice(0,3).join("|")}`;
-  const res=await fetch("/api/claude",{
-    method:"POST",headers:{"Content-Type":"application/json"},
-    body:JSON.stringify({
-      model:"claude-sonnet-4-20250514",
-      max_tokens:1400,
-      system:"Senior recruitment consultant. Return ONLY compact raw JSON object. No markdown.",
-      messages:[{role:"user",content:`Report for ${cand.name}. Return ONLY raw JSON object.
-JD: ${jdSnip}
-CV: ${cvSnip}
-${scores}
-{"executiveSummary":"3 sentences","valueProposition":"1 sentence","keySkillsAligned":[{"skill":"","evidence":"","relevance":""}],"experienceHighlights":[{"highlight":"","impact":""}],"potentialGaps":[{"gap":"","mitigation":""}],"salaryRange":{"min":0,"max":0,"currency":"INR","basis":""},"interviewFocus":"2 areas","clientReadyConclusion":"2 sentences"}`}]
-    })
-  });
-  if(res.status===429){
-    const raMs=await getRetryAfterMs(res);
-    const wait=raMs||(attempt+1)*10000;
-    if(attempt<2){await new Promise(r=>setTimeout(r,wait));return apiReport(jd,cand,attempt+1);}
-    throw new Error(`Service busy. Please wait ${Math.ceil(wait/1000)}s and retry.`);
-  }
-  if(!res.ok){if(attempt<1){await new Promise(r=>setTimeout(r,2000));return apiReport(jd,cand,attempt+1);} throw new Error("Report failed. Please retry.");}
-  _lastCallMs=Date.now();
-  const d=await res.json();
-  return d.content?.map(b=>b.text||"").join("")||"";
+  const jdSnip = jd.slice(0,600);
+  const cvSnip = cand.resumeText?.slice(0,1200)||"";
+  const scores = `score:${cand.overallScore} skill:${cand.skillMatch} exp:${cand.experienceRelevance} strengths:${(cand.strengths||[]).slice(0,2).join("|")} gaps:${(cand.missingSkills||[]).slice(0,3).join("|")}`;
+
+  const prompt = `You are a senior recruitment consultant. Generate an intelligence report for this candidate.
+Return ONLY a raw JSON object. No markdown. No explanation.
+
+JOB DESCRIPTION: ${jdSnip}
+CANDIDATE CV: ${cvSnip}
+SCORES: ${scores}
+
+Return this exact JSON object:
+{"executiveSummary":"3 sentences advisory tone","valueProposition":"1 sentence unique value for this role","keySkillsAligned":[{"skill":"","evidence":"","relevance":""}],"experienceHighlights":[{"highlight":"","impact":""}],"potentialGaps":[{"gap":"","mitigation":""}],"salaryRange":{"min":0,"max":0,"currency":"INR","basis":"market reasoning"},"interviewFocus":"2 specific areas to probe","clientReadyConclusion":"2 sentences clear recommendation"}`;
+
+  return callGemini(prompt, 1400, attempt);
 }
 
 // ─── API — PHASE 2B: INTERVIEW KIT ────────────────────────────────────────────
 async function apiInterview(jd, cand, attempt=0){
-  const jdSnip=jd.slice(0,400);
-  const meta=`${cand.currentRole||"Candidate"} | Score:${cand.overallScore} | Skills:${(cand.top5Skills||[]).slice(0,3).join(",")} | Missing:${(cand.missingSkills||[]).slice(0,2).join(",")}`;
-  const res=await fetch("/api/claude",{
-    method:"POST",headers:{"Content-Type":"application/json"},
-    body:JSON.stringify({
-      model:"claude-sonnet-4-20250514",
-      max_tokens:1400,
-      system:"HR interviewer. Return ONLY compact raw JSON object. No markdown.",
-      messages:[{role:"user",content:`Interview questions. Return ONLY raw JSON object.
-JD: ${jdSnip}
+  const jdSnip = jd.slice(0,400);
+  const meta = `${cand.currentRole||"Candidate"} | Score:${cand.overallScore} | Skills:${(cand.top5Skills||[]).slice(0,3).join(",")} | Missing:${(cand.missingSkills||[]).slice(0,2).join(",")}`;
+
+  const prompt = `You are a senior HR interviewer. Create an interview kit for this candidate.
+Return ONLY a raw JSON object. No markdown. No explanation.
+
+JOB DESCRIPTION: ${jdSnip}
 CANDIDATE: ${meta}
-2 technical, 2 behavioral, 2 situational, 3 scorecard criteria:
-{"technicalQuestions":[{"question":"","whatItReveals":"","greenFlag":"","redFlag":""}],"behavioralQuestions":[{"question":"STAR","competencyTested":"","scoringGuide":"1-5"}],"situationalQuestions":[{"question":"","idealResponse":""}],"scorecardCriteria":[{"criterion":"","weight":"High|Medium","howToAssess":""}],"structure":{"duration":"45 mins","format":"1:1","opening":"Walk me through your most relevant project","closing":"Do you have any questions about the role?"}}`}]
-    })
-  });
-  if(res.status===429){
-    const raMs=await getRetryAfterMs(res);
-    const wait=raMs||(attempt+1)*10000;
-    if(attempt<2){await new Promise(r=>setTimeout(r,wait));return apiInterview(jd,cand,attempt+1);}
-    throw new Error(`Service busy. Please wait ${Math.ceil(wait/1000)}s and retry.`);
-  }
-  if(!res.ok){if(attempt<1){await new Promise(r=>setTimeout(r,2000));return apiInterview(jd,cand,attempt+1);} throw new Error("Interview kit failed. Please retry.");}
-  _lastCallMs=Date.now();
-  const d=await res.json();
-  return d.content?.map(b=>b.text||"").join("")||"";
+
+Return exactly 2 technical, 2 behavioral, 2 situational questions and 3 scorecard criteria:
+{"technicalQuestions":[{"question":"","whatItReveals":"","greenFlag":"","redFlag":""}],"behavioralQuestions":[{"question":"STAR format","competencyTested":"","scoringGuide":"1=poor 3=ok 5=excellent"}],"situationalQuestions":[{"question":"","idealResponse":""}],"scorecardCriteria":[{"criterion":"","weight":"High|Medium","howToAssess":""}],"structure":{"duration":"45 mins","format":"1:1","opening":"Walk me through your most relevant project","closing":"Do you have any questions about the role?"}}`;
+
+  return callGemini(prompt, 1400, attempt);
 }
 
 // Generate red-flag probe questions locally from existing riskFlags — instant, no API
